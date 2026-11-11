@@ -3,6 +3,7 @@
 // FrameRing 是 RX 路径的核心：libusb 回调线程把拆出的以太帧写进去，
 // BPF 写线程取出来 write()。因此这里既测语义，也测并发。
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -350,6 +351,57 @@ TEST_CASE("批量接口并发搬运 20 万帧不丢不乱序") {
   producer.join();
   CHECK_FALSE(corrupted.load());
   CHECK(ring.TotalDequeued() == ring.TotalEnqueued());
+}
+
+TEST_CASE("空队列停放会在发布后唤醒") {
+  FrameRing ring(4, 64);
+  const std::uint64_t ticket = ring.ConsumerTicket();
+  std::atomic<bool> returned{false};
+
+  std::thread consumer([&] {
+    ring.ParkConsumer(ticket, std::chrono::seconds(1));
+    returned.store(true, std::memory_order_release);
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  REQUIRE(ring.TryPush(MakeFrame(64, 0x42)));
+  consumer.join();
+
+  CHECK(returned.load(std::memory_order_acquire));
+  const FrameView view = ring.BeginRead();
+  REQUIRE(view.length == 64);
+  CHECK(VerifyFrame(view.Bytes(), 0x42));
+}
+
+TEST_CASE("停放消费者在发布竞态下不丢唤醒") {
+  constexpr std::uint32_t kTotal = 50'000;
+  FrameRing ring(64, 64);
+
+  std::thread producer([&] {
+    for (std::uint32_t i = 0; i < kTotal;) {
+      if (ring.TryPush(MakeFrame(64, static_cast<std::uint8_t>(i)))) {
+        ++i;
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  for (std::uint32_t received = 0; received < kTotal;) {
+    const std::uint64_t ticket = ring.ConsumerTicket();
+    const FrameView view = ring.BeginRead();
+    if (view.Empty()) {
+      ring.ParkConsumer(ticket, std::chrono::milliseconds(100));
+      continue;
+    }
+    CHECK(VerifyFrame(view.Bytes(), static_cast<std::uint8_t>(received)));
+    ring.CommitRead();
+    ++received;
+  }
+
+  producer.join();
+  CHECK(ring.TotalEnqueued() == kTotal);
+  CHECK(ring.TotalDequeued() == kTotal);
 }
 
 }  // TEST_SUITE("common.frame_ring_batch")

@@ -23,10 +23,14 @@
 #pragma once
 
 #include <cassert>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 
 #include "tetherkit/common/cache.h"
@@ -111,6 +115,7 @@ class FrameRing {
     assert(length <= max_frame_bytes_);
     StoreLength(pending_write_index_, length);
     cursor_.PublishWrite();
+    NotifyConsumer();
   }
 
   /// 便捷入口：拷贝一整帧进队列。成功返回 true，队列满或帧超长返回 false。
@@ -192,6 +197,7 @@ class FrameRing {
     void Publish() noexcept {
       if (staged_ != 0) {
         ring_->cursor_.PublishWrite(staged_);
+        ring_->NotifyConsumer();
         published_ += staged_;
         staged_ = 0;
       }
@@ -299,6 +305,30 @@ class FrameRing {
 
   [[nodiscard]] BatchRead BeginBatchRead() noexcept { return BatchRead{*this}; }
 
+  /// 返回当前发布代数。消费者必须在检查队列前取得 ticket，再把同一个
+  /// ticket 传给 ParkConsumer，避免「检查为空 → 发布 → 开始等待」之间丢唤醒。
+  [[nodiscard]] std::uint64_t ConsumerTicket() const noexcept {
+    return consumer_epoch_.load(std::memory_order_acquire);
+  }
+
+  /// 队列暂时为空时阻塞消费者。发布新帧、WakeConsumer 或 timeout 会返回。
+  ///
+  /// 生产者只做一次 epoch 增量和一次 parked 标志读取；不持锁、不分配、不进入
+  /// 内核。只有真正空闲的消费者才会走条件变量。
+  void ParkConsumer(std::uint64_t ticket, std::chrono::milliseconds timeout) noexcept {
+    std::unique_lock<std::mutex> lock(consumer_park_mutex_);
+    consumer_parked_.store(true, std::memory_order_release);
+    if (consumer_epoch_.load(std::memory_order_acquire) == ticket) {
+      consumer_park_condition_.wait_for(lock, timeout, [this, ticket] {
+        return consumer_epoch_.load(std::memory_order_acquire) != ticket;
+      });
+    }
+    consumer_parked_.store(false, std::memory_order_release);
+  }
+
+  /// 唤醒正在等待的消费者。用于停机和暂停状态切换。
+  void WakeConsumer() noexcept { NotifyConsumer(); }
+
   // ---------------------------------------------------------------------------
   // 观测
   // ---------------------------------------------------------------------------
@@ -310,6 +340,13 @@ class FrameRing {
   [[nodiscard]] std::uint64_t TotalDequeued() const noexcept { return cursor_.TotalDequeued(); }
 
  private:
+  void NotifyConsumer() noexcept {
+    consumer_epoch_.fetch_add(1, std::memory_order_release);
+    if (consumer_parked_.load(std::memory_order_acquire)) {
+      consumer_park_condition_.notify_one();
+    }
+  }
+
   // 两个批量会话类需要直接访问游标与槽位寻址，避免在热路径上多一层转发。
   friend class BatchWrite;
   friend class BatchRead;
@@ -371,6 +408,12 @@ class FrameRing {
   // 前面为 SpscCursor 做的缓存行隔离就全白费了。
   TETHERKIT_CACHE_ALIGNED std::size_t pending_write_index_ = 0;
   TETHERKIT_CACHE_ALIGNED std::size_t pending_read_index_ = 0;
+
+  // 发布代数只用于空闲消费者的等待协调，不参与槽位所有权。
+  TETHERKIT_CACHE_ALIGNED std::atomic<std::uint64_t> consumer_epoch_{0};
+  std::atomic<bool> consumer_parked_{false};
+  std::mutex consumer_park_mutex_;
+  std::condition_variable consumer_park_condition_;
 };
 
 }  // namespace tetherkit

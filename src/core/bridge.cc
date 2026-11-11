@@ -18,6 +18,8 @@ namespace {
 /// 与等待期间的无谓唤醒频率。槽位实际的释放周期是几百微秒（一次 bulk OUT 的
 /// 完成时间），绝大多数等待都由完成回调的 notify 提前唤醒，几乎不会等满。
 constexpr std::uint32_t kTxCapacityWaitMillis = 50;
+constexpr auto kRxIdleParkDelay = std::chrono::microseconds(100);
+constexpr auto kRxParkTimeout = std::chrono::milliseconds(100);
 
 /// 把字节数换算成 Mbps。
 [[nodiscard]] double ToMegabitsPerSecond(std::uint64_t bytes, double seconds) {
@@ -91,6 +93,7 @@ void Bridge::Stop() {
   //     而这里是调用 Stop() 的那个线程（主线程或控制线程），安全。
   // ---------------------------------------------------------------------------
   stop_requested_.store(true, std::memory_order_release);
+  rx_ring_->WakeConsumer();
 
   link_->Interrupt();
 
@@ -112,6 +115,7 @@ void Bridge::Stop() {
 
 void Bridge::SetPaused(bool paused) noexcept {
   paused_.store(paused, std::memory_order_release);
+  rx_ring_->WakeConsumer();
   if (!paused) {
     return;
   }
@@ -133,8 +137,13 @@ void Bridge::RunReceiveInjector() noexcept {
   TETHERKIT_DEBUG_TR(Msg::kCoreRxInjectorStarted);
 
   std::uint32_t idle_spins = 0;
+  std::chrono::steady_clock::time_point idle_since{};
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
+    // 先取得发布代数，再检查队列。即使生产者恰好在空检查后发布，ParkConsumer
+    // 也会发现代数变化并立即返回，不会把这次发布睡过去。
+    const std::uint64_t park_ticket = rx_ring_->ConsumerTicket();
+
     // 先撤销确认位，再判断是否暂停。顺序不能反 —— 留着上一轮的 true 会让
     // SetPaused(true) 误以为本线程已经停住，而它其实正要去取帧。
     rx_paused_ack_.store(false, std::memory_order_release);
@@ -145,7 +154,7 @@ void Bridge::RunReceiveInjector() noexcept {
       // 置确认位是给 SetPaused(true) 看的：从这里到下一轮看见 paused_ 变回
       // false 之前，本线程不会碰 rx_ring_，所以这个确认是可信的。
       rx_paused_ack_.store(true, std::memory_order_release);
-      std::this_thread::yield();
+      rx_ring_->ParkConsumer(park_ticket, kRxParkTimeout);
       continue;
     }
 
@@ -164,15 +173,23 @@ void Bridge::RunReceiveInjector() noexcept {
 
       if (rx_batch_.empty()) {
         // 队列空。先自旋一小会儿覆盖「生产者正在写下一帧」这种极短空窗，
-        // 再让出 CPU —— 纯自旋会白烧一个核，直接 yield 又会在高吞吐下抬高延迟。
+        // 再让出 CPU；持续空闲超过短暂退避窗口后进入阻塞等待。
+        if (idle_since == std::chrono::steady_clock::time_point{}) {
+          idle_since = std::chrono::steady_clock::now();
+        }
         if (++idle_spins < config_.rx_spin_before_yield) {
           continue;
         }
         idle_spins = 0;
         std::this_thread::yield();
+        if (std::chrono::steady_clock::now() - idle_since >= kRxIdleParkDelay) {
+          rx_ring_->ParkConsumer(park_ticket, kRxParkTimeout);
+          idle_since = {};
+        }
         continue;
       }
       idle_spins = 0;
+      idle_since = {};
 
       const auto result = link_->WriteFrames(rx_batch_);
       if (!result) {

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 
@@ -69,6 +70,43 @@ bool WaitFor(Predicate predicate, std::chrono::milliseconds timeout = std::chron
   return predicate();
 }
 
+std::int64_t ProcessCpuMicros() {
+  ::rusage usage{};
+  if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+    return -1;
+  }
+  return static_cast<std::int64_t>(usage.ru_utime.tv_sec) * 1'000'000 +
+         usage.ru_utime.tv_usec + static_cast<std::int64_t>(usage.ru_stime.tv_sec) * 1'000'000 +
+         usage.ru_stime.tv_usec;
+}
+
+class BlockingIdleLink final : public tetherkit::net::LinkBackend {
+ public:
+  [[nodiscard]] tetherkit::Result<tetherkit::net::ReadBatch> ReadFrames() override {
+    while (!interrupted_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return tetherkit::net::ReadBatch{};
+  }
+
+  [[nodiscard]] tetherkit::Result<tetherkit::net::WriteResult> WriteFrames(
+      tetherkit::net::FrameBatch frames) override {
+    return tetherkit::net::WriteResult{
+        .frames_written = static_cast<std::uint32_t>(frames.size()),
+        .bytes_written = 0,
+        .frames_skipped = 0};
+  }
+
+  [[nodiscard]] std::uint32_t MaxFrameBytes() const noexcept override { return 1518; }
+
+  [[nodiscard]] bool SupportsBatchWrite() const noexcept override { return true; }
+
+  void Interrupt() noexcept override { interrupted_.store(true, std::memory_order_release); }
+
+ private:
+  std::atomic<bool> interrupted_{false};
+};
+
 /// 测试用的桥接配置：小队列、小批次，让边界更容易被触发。
 [[nodiscard]] BridgeConfig TestConfig() {
   BridgeConfig config;
@@ -103,6 +141,37 @@ TEST_CASE("启动与停止：线程正常起停，停机时通道被关闭") {
 
   // Stop 是幂等的。
   bridge.Stop();
+}
+
+TEST_CASE("RX 空闲时注入线程不持续占用 CPU") {
+  MockDataChannel channel;
+  BlockingIdleLink link;
+  Bridge bridge(channel, link, TestConfig());
+
+  const std::int64_t before = ProcessCpuMicros();
+  REQUIRE(before >= 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const std::int64_t after = ProcessCpuMicros();
+
+  bridge.Stop();
+  REQUIRE(after >= before);
+  CHECK(after - before < 150'000);
+}
+
+TEST_CASE("RX 暂停时注入线程不持续占用 CPU") {
+  MockDataChannel channel;
+  BlockingIdleLink link;
+  Bridge bridge(channel, link, TestConfig());
+  bridge.SetPaused(true);
+
+  const std::int64_t before = ProcessCpuMicros();
+  REQUIRE(before >= 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const std::int64_t after = ProcessCpuMicros();
+
+  bridge.Stop();
+  REQUIRE(after >= before);
+  CHECK(after - before < 150'000);
 }
 
 TEST_CASE("RX 方向：设备发来的帧被搬到链路上，内容完整") {

@@ -277,6 +277,12 @@ Swift 的 C++ 互操作吞不下，所以 C ABI 这一层不可省。
   每台设备上次成功读到的字符串，读不到就回填；helper 的占用判定同步修正
   （握手窗口算占用、failed/stopped 死会话不算）。真机复核过（read_strings
   =false 时名字完整）。见第 7 节第 17 条
+- **已修复**（2026-11-11）：RX 注入线程在空队列与暂停状态下不再用 `yield()` 无限空转。
+  `FrameRing` 增加发布代数与条件变量停放/唤醒，生产者发布帧、暂停切换、停机都能
+  唤醒消费者；新增空闲/暂停 CPU 回归测试，23 个 CTest 用例全部通过。GUI bundle
+  已构建并启动；本机直接运行 App 的 SwiftUI 进程存在独立的高 CPU 波动，但
+  `tetherkit-helper` 空闲实测 0.0% CPU。GUI Swift tests 在本机 Command Line Tools
+  环境因缺少 XCTest 模块而无法编译（`no such module 'XCTest'`）。
 - **仍未查清**：TCP TX 呈双峰（约 240 / 约 300 Mbps，两态都零重传）；
   双向并发时 RTT 仍从 0.4 ms 膨胀到 16.6 ms（已不再造成吞吐塌陷）
 
@@ -472,6 +478,23 @@ TX 就从 4.8 回到了 87 Mbps。
 `SendFrames` 返回错误时批次剩余帧不进任何计数器，凭空消失。
 
 ---
+
+### 6.6 已修复：RX 空闲 CPU 异常
+
+Issue #5 的根因是 `Bridge::RunReceiveInjector` 在 `FrameRing` 为空时只调用
+`std::this_thread::yield()`。Darwin 上 `yield()` 不是睡眠；没有同优先级就绪线程时
+会立即返回，线程因此持续占用一个核。暂停分支存在相同问题。
+
+修复后采用三段式退避：短暂自旋 → `yield()` → 空闲超过 100 µs 后进入条件变量等待。
+`FrameRing` 用发布代数作为 ticket，消费者先取 ticket 再检查队列，生产者发布时增代
+并在需要时通知；这避免了「检查为空后刚好发布」的丢唤醒竞态。`Stop()` 和
+`SetPaused()` 显式唤醒消费者，停机不依赖 100 ms 超时。
+
+离线回归覆盖：
+
+- `common.frame_ring_batch`：发布唤醒与 50,000 帧发布竞态，无丢唤醒；
+- `core.bridge`：空闲与暂停 400 ms 窗口的进程 CPU 时间均低于 150 ms；
+- `ctest --test-dir build --output-on-failure`：23/23 通过。
 
 ## 7. 已知坑与规避（**踩过的坑写在这里，不要重复踩**）
 
