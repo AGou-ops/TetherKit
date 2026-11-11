@@ -18,6 +18,49 @@ struct ThroughputSample: Identifiable {
                                        transmitPacketsPerSecond: 0)
 }
 
+/// 高频变化的会话计数器，与低频状态分开发布，避免每个采样点重排整棵界面。
+struct SessionMetrics: Equatable {
+    let rxFrames: UInt64
+    let rxBytes: UInt64
+    let rxDropped: UInt64
+    let txFrames: UInt64
+    let txBytes: UInt64
+    let txDropped: UInt64
+    let rxQueueDepth: UInt64
+    let linkKernelDrops: UInt64
+    let txBackpressure: UInt64
+
+    static let zero = SessionMetrics(
+        rxFrames: 0, rxBytes: 0, rxDropped: 0, txFrames: 0, txBytes: 0, txDropped: 0,
+        rxQueueDepth: 0, linkKernelDrops: 0, txBackpressure: 0)
+
+    init(status: SessionStatus) {
+        rxFrames = status.rxFrames
+        rxBytes = status.rxBytes
+        rxDropped = status.rxDropped
+        txFrames = status.txFrames
+        txBytes = status.txBytes
+        txDropped = status.txDropped
+        rxQueueDepth = status.rxQueueDepth
+        linkKernelDrops = status.linkKernelDrops
+        txBackpressure = status.txBackpressure
+    }
+
+    private init(rxFrames: UInt64, rxBytes: UInt64, rxDropped: UInt64, txFrames: UInt64,
+                 txBytes: UInt64, txDropped: UInt64, rxQueueDepth: UInt64,
+                 linkKernelDrops: UInt64, txBackpressure: UInt64) {
+        self.rxFrames = rxFrames
+        self.rxBytes = rxBytes
+        self.rxDropped = rxDropped
+        self.txFrames = txFrames
+        self.txBytes = txBytes
+        self.txDropped = txDropped
+        self.rxQueueDepth = rxQueueDepth
+        self.linkKernelDrops = linkKernelDrops
+        self.txBackpressure = txBackpressure
+    }
+}
+
 /// 连续重复的日志折叠成一条。
 ///
 /// 周期性路径（比如每 2 秒一次的设备枚举）会把同一句话刷成一整列，淹没真正
@@ -109,6 +152,7 @@ final class AppModel {
     private(set) var environment: EnvironmentReport?
     private(set) var devices: [DeviceDescriptor] = []
     private(set) var status: SessionStatus = .idle
+    private(set) var sessionMetrics: SessionMetrics = .zero
     private(set) var networkState: NetworkState = .empty
     private(set) var throughput: ThroughputSample = .zero
     private(set) var throughputHistory: [ThroughputSample] = []
@@ -190,9 +234,9 @@ final class AppModel {
 
     /// 轮询周期。
     ///
-    /// 500 ms 是「看起来实时」与「别把 XPC 往返变成负担」的平衡点：更快对人眼
-    /// 已无区别，更慢会让速率曲线看起来一顿一顿的。
-    private static let pollInterval: Duration = .milliseconds(500)
+    /// 1 s 足够刷新实时数字；把轮询降到人眼无差别的频率，避免每次 XPC
+    /// 回包都触发 SwiftUI 整棵界面的布局。
+    private static let pollInterval: Duration = .seconds(1)
 
     /// 纯后台待机（窗口关着、会话没跑）时的轮询间隔。
     private static let backgroundPollInterval: Duration = .seconds(2)
@@ -203,8 +247,9 @@ final class AppModel {
     /// 响应延迟用户基本感觉不到，而开销降到了原来的四分之一。
     private static let deviceRefreshInterval: Duration = .seconds(2)
 
-    /// 吞吐曲线保留的采样点数。120 点 × 500 ms = 最近 60 秒。
-    private static let historyCapacity = 120
+    /// 吞吐曲线每 2 秒取一个点，保留最近 60 秒；实时数字仍按 500 ms 更新。
+    private static let historyCapacity = 30
+    private static let historyInterval: TimeInterval = 2
 
     /// 日志面板保留的行数。
     ///
@@ -307,19 +352,35 @@ final class AppModel {
         do {
             let (revision, version) = HelperConstants.decodeVersion(try await client.helperVersion())
             guard revision == HelperConstants.protocolRevision else {
-                helperAvailability = .outdated(installed: revision,
-                                               expected: HelperConstants.protocolRevision)
+                let availability = HelperAvailability.outdated(installed: revision,
+                                                               expected: HelperConstants.protocolRevision)
+                if helperAvailability != availability {
+                    helperAvailability = availability
+                }
                 // 协议对不上时不再另报版本不一致：那张卡本来就是要用户去更新组件，
                 // 同一件事说两遍只会让人怀疑是两个问题。
-                helperVersionMismatch = nil
+                if helperVersionMismatch != nil {
+                    helperVersionMismatch = nil
+                }
                 // 接口对不上就别继续发请求了 —— 参数与应答的形状都可能不一致。
                 return
             }
-            helperAvailability = .available(version: version)
-            helperVersionMismatch = Self.versionMismatch(installed: version)
+            let availability = HelperAvailability.available(version: version)
+            if helperAvailability != availability {
+                helperAvailability = availability
+            }
+            let mismatch = Self.versionMismatch(installed: version)
+            if helperVersionMismatch != mismatch {
+                helperVersionMismatch = mismatch
+            }
         } catch {
-            helperAvailability = .missing(reason: error.localizedDescription)
-            helperVersionMismatch = nil
+            let availability = HelperAvailability.missing(reason: error.localizedDescription)
+            if helperAvailability != availability {
+                helperAvailability = availability
+            }
+            if helperVersionMismatch != nil {
+                helperVersionMismatch = nil
+            }
             // 连不上就别再发后续请求了 —— 每一个都会重复同样的失败，
             // 只会把日志刷满。
             return
@@ -344,29 +405,54 @@ final class AppModel {
         // 完全不影响体感。
         if status.runState != .running, shouldRefreshDevices() {
             if let fresh = try? await client.listDevices() {
-                devices = fresh
+                if devices != fresh {
+                    devices = fresh
+                }
                 // 用户选中的设备被拔掉后，选择要跟着失效，否则「启动」会按一个
                 // 不存在的总线地址去找设备。
                 if let selected = selectedDeviceID,
-                   !devices.contains(where: { $0.id == selected }) {
+                   !fresh.contains(where: { $0.id == selected }) {
                     selectedDeviceID = nil
                 }
             }
         }
 
+        let freshNetworkState: NetworkState
         if !status.systemInterface.isEmpty {
-            networkState = (try? await client.queryNetwork(interface: status.systemInterface))
+            freshNetworkState = (try? await client.queryNetwork(interface: status.systemInterface))
                 ?? .empty
         } else {
-            networkState = .empty
+            freshNetworkState = .empty
+        }
+        if networkState != freshNetworkState {
+            networkState = freshNetworkState
         }
     }
 
 
     private func apply(status fresh: SessionStatus) {
-        defer {
-            previousStatus = fresh
-            status = fresh
+        guard fresh != previousStatus else { return }
+        let previous = previousStatus
+        previousStatus = fresh
+
+        let freshMetrics = SessionMetrics(status: fresh)
+        if sessionMetrics != freshMetrics {
+            sessionMetrics = freshMetrics
+        }
+
+        // 计数器单独发布；status 只保留低频字段，避免每个采样点重排整棵界面。
+        var displayStatus = fresh
+        displayStatus.rxFrames = status.rxFrames
+        displayStatus.rxBytes = status.rxBytes
+        displayStatus.rxDropped = status.rxDropped
+        displayStatus.txFrames = status.txFrames
+        displayStatus.txBytes = status.txBytes
+        displayStatus.txDropped = status.txDropped
+        displayStatus.rxQueueDepth = status.rxQueueDepth
+        displayStatus.linkKernelDrops = status.linkKernelDrops
+        displayStatus.txBackpressure = status.txBackpressure
+        if displayStatus != status {
+            status = displayStatus
         }
 
         // 记录/清除连接时刻，用于显示已连接时长。
@@ -376,7 +462,7 @@ final class AppModel {
             sessionStartedAt = nil
         }
 
-        guard let previous = previousStatus,
+        guard let previous,
               fresh.runState == .running,
               fresh.monotonicNanos > previous.monotonicNanos else {
             if fresh.runState != .running {
@@ -398,6 +484,10 @@ final class AppModel {
             transmitPacketsPerSecond: Double(fresh.txFrames &- previous.txFrames) / seconds)
 
         throughput = sample
+        if let last = throughputHistory.last,
+           sample.timestamp.timeIntervalSince(last.timestamp) < Self.historyInterval {
+            return
+        }
         throughputHistory.append(sample)
         if throughputHistory.count > Self.historyCapacity {
             throughputHistory.removeFirst(throughputHistory.count - Self.historyCapacity)
@@ -411,7 +501,9 @@ final class AppModel {
                 logs.removeFirst(logs.count - Self.logCapacity)
             }
         }
-        droppedLogCount += feed.droppedLogs
+        if feed.droppedLogs > 0 {
+            droppedLogCount += feed.droppedLogs
+        }
     }
 
     // MARK: - 动作

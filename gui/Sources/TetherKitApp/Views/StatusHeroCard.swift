@@ -144,14 +144,13 @@ struct StatusHeroCard: View {
 
 /// 状态圆环。
 ///
-/// 运行中时外圈缓慢旋转、内圈呼吸 —— 这是界面上唯一的动效，用来表达「它在活着
-/// 干活」。其余状态一律静止，避免把注意力浪费在没有信息量的动画上。
+/// 只有启动/停止等过渡态使用短时旋转动画；稳定运行态保持静态，避免持续的
+/// display link 重绘占用 CPU。其余状态一律静止，避免把注意力浪费在没有信息量的动画上。
 private struct StatusRing: View {
     let status: SessionStatus
     let accent: Color
 
     @State private var rotation: Double = 0
-    @State private var breathing = false
 
     private var isActive: Bool { status.runState == .running && status.linkUp }
     private var isWorking: Bool { status.runState.isTransitional }
@@ -161,7 +160,6 @@ private struct StatusRing: View {
             Circle()
                 .fill(accent.opacity(0.12))
                 .frame(width: 64, height: 64)
-                .scaleEffect(breathing && isActive ? 1.08 : 1.0)
 
             Circle()
                 .stroke(accent.opacity(0.25), lineWidth: 3)
@@ -192,9 +190,6 @@ private struct StatusRing: View {
             }
         } else {
             rotation = 0
-        }
-        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
-            breathing = isActive
         }
     }
 }

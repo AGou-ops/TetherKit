@@ -277,12 +277,12 @@ Swift 的 C++ 互操作吞不下，所以 C ABI 这一层不可省。
   每台设备上次成功读到的字符串，读不到就回填；helper 的占用判定同步修正
   （握手窗口算占用、failed/stopped 死会话不算）。真机复核过（read_strings
   =false 时名字完整）。见第 7 节第 17 条
-- **已修复**（2026-11-11）：RX 注入线程在空队列与暂停状态下不再用 `yield()` 无限空转。
-  `FrameRing` 增加发布代数与条件变量停放/唤醒，生产者发布帧、暂停切换、停机都能
-  唤醒消费者；新增空闲/暂停 CPU 回归测试，23 个 CTest 用例全部通过。GUI bundle
-  已构建并启动；本机直接运行 App 的 SwiftUI 进程存在独立的高 CPU 波动，但
-  `tetherkit-helper` 空闲实测 0.0% CPU。GUI Swift tests 在本机 Command Line Tools
-  环境因缺少 XCTest 模块而无法编译（`no such module 'XCTest'`）。
+- **已修复/优化**（2026-11-11）：GUI 的 SwiftUI 轮询不再无条件发布相同状态；高频
+  会话计数器与低频状态拆开，吞吐图表改为每 2 秒采样 30 点并独立成子视图，稳定
+  运行态圆环不再启动常驻呼吸动画，活动轮询从 500 ms 调整为 1 s。构建后的 GUI
+  实测 CPU 从原先约 20%~35% 降到约 1.7%~8.9%；root helper 持续为 0.0%。
+  Swift GUI tests 仍因本机 Command Line Tools 缺少 XCTest 模块无法编译
+  （`no such module 'XCTest'`），GUI release bundle 构建成功。
 - **仍未查清**：TCP TX 呈双峰（约 240 / 约 300 Mbps，两态都零重传）；
   双向并发时 RTT 仍从 0.4 ms 膨胀到 16.6 ms（已不再造成吞吐塌陷）
 
